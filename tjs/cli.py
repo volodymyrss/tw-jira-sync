@@ -1,4 +1,6 @@
 from email.policy import default
+import re
+from attr import fields
 import click
 import json
 from taskw import TaskWarrior
@@ -9,6 +11,20 @@ import subprocess
 # jira = JIRA('https://odahub.atlassian.com')
 
 
+def duration_to_seconds(duration_str):
+    match = re.match(
+        (r'P((?P<years>\d+)Y)?((?P<months>\d+)M)?((?P<weeks>\d+)W)?'
+         r'((?P<days>\d+)D)?'
+         r'T((?P<hours>\d+)H)?((?P<minutes>\d+)M)?((?P<seconds>\d+)S)?'),
+        duration_str
+    ).groupdict()
+    return int(match['years'] or 0)*365*24*3600 + \
+        int(match['months'] or 0)*30*24*3600 + \
+        int(match['weeks'] or 0)*7*24*3600 + \
+        int(match['days'] or 0)*24*3600 + \
+        int(match['hours'] or 0)*3600 + \
+        int(match['minutes'] or 0)*60 + \
+        int(match['seconds'] or 0)
 
 @click.group()
 @click.option('-p', '--project', default="VS")
@@ -18,11 +34,27 @@ def cli(obj, project):
     obj['auth_jira'] = JIRA('https://odahub.atlassian.net', 
                             basic_auth=('vladimir.savchenko@gmail.com',
                                         subprocess.check_output(['pass', 'jiracould']).decode().strip()))
+
+
+def print_issue(issue, long):
+    print('\033[31m{}\033[0m: \033[33m{}\033[0m'.format(issue.key, issue.fields.summary))
+
+    if long:
+        for k in dir(issue.fields):
+            if not k.startswith("_"):
+                v = getattr(issue.fields, k)
+                print('    \033[36m{}\033[0m: {}'.format(k, v))
+
+        for issue_link in issue.fields.issuelinks:
+            print(f"{issue_link}: {issue_link.type} {issue_link.outwardIssue}")
+            # for k in dir(issue_link):
+            #     print(f" > {k} {getattr(issue_link, k)}")
             
 @cli.command()
+@click.option('-i', '--task-id', type=int, default=None)
 @click.option("-l", "--long", is_flag=True)
 @click.pass_obj
-def list(obj, long):
+def list(obj, long, task_id):
     proj = obj['project']
     jira = obj['auth_jira']
 
@@ -34,13 +66,14 @@ def list(obj, long):
     # oh_crap = jira.search_issues('assignee = currentUser() and due < endOfWeek() order by priority desc', maxResults=5)
 
     # Summaries of my last 3 reported issues
-    for issue in jira.search_issues(f'project={proj} order by created desc', maxResults=False):
-        print('{}: {}'.format(issue.key, issue.fields.summary))
 
-        if long:
-            for k in dir(issue.fields):
-                if not k.startswith("_"):
-                    print('    {}: {}'.format(k, getattr(issue.fields, k)))
+    extra_filter = ''
+    if task_id is not None:
+        extra_filter =  f'AND TaskWarriorID = {task_id}'
+
+    for issue in jira.search_issues(f'project={proj} {extra_filter} order by created desc ', maxResults=False):
+        print_issue(issue, long)
+
 
 # issue = jira.issue('JRA-9')
 # print(issue.fields.project.key)            # 'JRA'
@@ -51,8 +84,9 @@ def list(obj, long):
             
 @cli.command()
 @click.option('-i', '--task-id', type=int)
+@click.option("-l", "--long", is_flag=True)
 @click.pass_obj
-def push(obj, task_id):
+def push(obj, task_id, long):
     proj = obj['project']
     jira = obj['auth_jira']
 
@@ -85,43 +119,82 @@ def push(obj, task_id):
             print("found:", taskid, existing_issues)            
             issue = existing_issues[0]
             
-            issue.update(labels=None) #",".join(task['tags']))
-
-            tags = task.get('tags', [])
-
-            for tag_field in ['project', 'gitlabnamespace']:
-                if tag_field in task:
-                    tags.append(task[tag_field])
-
-
-
-            print("updating labels", tags)
-
-            for tag in tags:
-                issue.add_field_value(
-                    'labels', tag
-                )
-
-            if 'gitlabtitle' in task:
-                print('updating title')
-                issue.update(summary=task['gitlabtitle'])
-
-            for url_field in ['redmineurl']:
-                if url_field in task:
-                    issue.add_field_value('issuelinks', task[url_field])
-            
 
         else:
             print("NOT found, will create")
             issue = jira.create_issue(
                 project=proj, 
-                summary=task['description'],
-                description="\n".join([f"{k}: {v}" for k, v in task.items()]), 
-                issuetype={'name': 'Task'},
                 customfield_10035 = task['id'],            
                 )
 
             print('created: {}: {}'.format(issue.key, issue.fields.summary))
+        
+
+        # title 
+
+        for title_key in ['redminesubject', 'gitlabtitle']:
+            if title_key in task:
+                print('updating title')
+                task['description'] = task[title_key]
+
+        # base
+
+        issuetype = 'Task'
+        for issuetype_key in ['redminetracker']:
+            if issuetype_key in task:
+                issuetype = task[issuetype_key]        
+                print('issuetype:', issuetype)
+
+        fields = dict(
+                    summary=task['description'],
+                    description="\n".join([f"{k}: {v}" for k, v in task.items()]), 
+                    issuetype={'name': issuetype},
+                    labels=None,
+            )
+
+        # estimate
+
+        estimate_s = None
+        for estimate_key in ['redmineestimatedhours']:
+            if estimate_key in task:
+                estimate_s = duration_to_seconds(task[estimate_key])
+                fields['timetracking'] = {
+                    "originalEstimate": f"{int(estimate_s/60.)}m"
+                }                
+
+        
+        issue.update(**fields) 
+
+        # tags
+
+        tags = task.get('tags', [])
+
+        for tag_field in ['project', 'gitlabnamespace']:
+            if tag_field in task:
+                tags.append(task[tag_field])
+
+        print("updating labels", tags)
+
+        
+        for tag in tags:
+            issue.add_field_value(
+                'labels', tag
+            )
+
+        # urls
+
+        for url_field, title in [
+                ('redmineurl', "Redmine URL")
+            ]:
+            if url_field in task:
+                print('adding', task[url_field])
+                jira.add_simple_link(issue, {
+                    "url": task[url_field],
+                    "title": title
+                })
+
+        print_issue(issue, long)
+            
 
 
 # issue = jira.issue('JRA-9')
