@@ -85,8 +85,9 @@ def list(obj, long, task_id):
 @cli.command()
 @click.option('-i', '--task-id', type=int)
 @click.option("-l", "--long", is_flag=True)
+@click.option("-U", "--allow-update", is_flag=True)
 @click.pass_obj
-def push(obj, task_id, long):
+def push(obj, task_id, long, allow_update):
     proj = obj['project']
     jira = obj['auth_jira']
 
@@ -107,6 +108,12 @@ def push(obj, task_id, long):
         if task_id is not None and task_id != taskid:
             continue
 
+        issuetype = 'Task'
+        for issuetype_key in ['redminetracker']:
+            if issuetype_key in task:
+                issuetype = task[issuetype_key]        
+                print('issuetype:', issuetype)
+
         # tw_label = f"TaskWarrior:{task['id']}"
 
         existing_issues = [i for i in jira.search_issues(f'project={proj} AND TaskWarriorID = {taskid}')]
@@ -117,14 +124,20 @@ def push(obj, task_id, long):
 
         elif len(existing_issues) == 1:
             print("found:", taskid, existing_issues)            
-            issue = existing_issues[0]
-            
 
+            if not allow_update:
+                print("skipping updates!")
+                continue
+
+            issue = existing_issues[0]
+                        
         else:
             print("NOT found, will create")
             issue = jira.create_issue(
-                project=proj, 
-                customfield_10035 = task['id'],            
+                    summary=task['description'],
+                    project=proj,
+                    customfield_10035 = task['id'],            
+                    issuetype={'name': issuetype},
                 )
 
             print('created: {}: {}'.format(issue.key, issue.fields.summary))
@@ -139,16 +152,10 @@ def push(obj, task_id, long):
 
         # base
 
-        issuetype = 'Task'
-        for issuetype_key in ['redminetracker']:
-            if issuetype_key in task:
-                issuetype = task[issuetype_key]        
-                print('issuetype:', issuetype)
 
         fields = dict(
                     summary=task['description'],
                     description="\n".join([f"{k}: {v}" for k, v in task.items()]), 
-                    issuetype={'name': issuetype},
                     labels=None,
             )
 
