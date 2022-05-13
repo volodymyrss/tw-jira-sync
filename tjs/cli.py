@@ -1,39 +1,103 @@
-from email.policy import default
+import os
+import pathlib
+import pickle
 import re
-from attr import fields
+import time
+from typing import Optional, Any, Dict
 import click
 import json
+import logging
 from taskw import TaskWarrior
 
 from jira import JIRA
+from jira.resources import Issue
 import subprocess
 
-# jira = JIRA('https://odahub.atlassian.com')
+from tjs.utils import duration_to_seconds
 
+logger = logging.getLogger(__name__)
 
-def duration_to_seconds(duration_str):
-    match = re.match(
-        (r'P((?P<years>\d+)Y)?((?P<months>\d+)M)?((?P<weeks>\d+)W)?'
-         r'((?P<days>\d+)D)?'
-         r'T((?P<hours>\d+)H)?((?P<minutes>\d+)M)?((?P<seconds>\d+)S)?'),
-        duration_str
-    ).groupdict()
-    return int(match['years'] or 0)*365*24*3600 + \
-        int(match['months'] or 0)*30*24*3600 + \
-        int(match['weeks'] or 0)*7*24*3600 + \
-        int(match['days'] or 0)*24*3600 + \
-        int(match['hours'] or 0)*3600 + \
-        int(match['minutes'] or 0)*60 + \
-        int(match['seconds'] or 0)
+class TaskWarriorJIRA(JIRA):
+    # overrides to assume project
+
+    def __init__(self, *args, project_name, reset_cache, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.project_name = project_name
+
+        if reset_cache:
+            self.reset_cache()
+        else:
+            self.load_cache()
+
+    def search_issues(self, jql_str: str, *args, **kwargs):
+        return super().search_issues(f"project={self.project_name} AND " + jql_str, *args, **kwargs)
+
+    def create_issue(self, taskid: int, fields: Optional[Dict[str, Any]] = None, prefetch: bool = True, **fieldargs) -> Issue:        
+        return super().create_issue(fields, 
+                                    prefetch,
+                                    project=self.project_name,
+                                    customfield_10035 = taskid,
+                                    **fieldargs)            
+
+    # -----
+
+    @property
+    def cache_fn(self):
+        return os.path.join(os.getenv('HOME', '/tmp/'), ".cache/tw-jira-sync.pickle")
+
+    def load_cache(self):        
+        try:
+            self.cache_by_taskid = pickle.load(open(self.cache_fn, "rb"))
+        except Exception as e:
+            self.cache_by_taskid = {}
+
+    def reset_cache(self):
+        self.cache_by_taskid = {}
+        self.write_cache()
+
+    def write_cache(self):        
+        os.makedirs(os.path.dirname(self.cache_fn), exist_ok=True)
+        pickle.dump(self.cache_by_taskid, open(self.cache_fn, "wb"))
+    
+
+    def issue_for_taskid(self, taskid: int, use_cache=False):
+        logger.debug('will find issue_for_taskid')
+        if use_cache:
+            if taskid in self.cache_by_taskid:
+                logger.debug("found in cache: %s, %s", taskid, self.cache_by_taskid[taskid])            
+                return self.cache_by_taskid[taskid]
+                
+        issues = [i for i in self.search_issues(f'TaskWarriorID = {taskid}')]
+
+        if len(issues) > 1:
+            print("found many!", taskid, issues)            
+            raise NotImplementedError
+        elif len(issues) == 0:
+            print("found none!", taskid, issues)            
+            return None
+        else:
+            print("found this:", taskid, issues)            
+            self.cache_by_taskid[taskid] = issues[0]
+            self.write_cache()
+            return issues[0]
+
 
 @click.group()
 @click.option('-p', '--project', default="VS")
+@click.option('-v', '--verbose', is_flag=True)
+@click.option('-R', '--reset-cache', is_flag=True)
 @click.pass_obj
-def cli(obj, project):
-    obj['project'] = project
-    obj['auth_jira'] = JIRA('https://odahub.atlassian.net', 
+def cli(obj, project, verbose, reset_cache):
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+
+    obj['auth_jira'] = TaskWarriorJIRA(
+                            'https://odahub.atlassian.net', 
+                            project_name=project,
+                            reset_cache=reset_cache,
                             basic_auth=('vladimir.savchenko@gmail.com',
                                         subprocess.check_output(['pass', 'jiracould']).decode().strip()))
+                                    
 
 
 def print_issue(issue, long):
@@ -55,7 +119,6 @@ def print_issue(issue, long):
 @click.option("-l", "--long", is_flag=True)
 @click.pass_obj
 def list(obj, long, task_id):
-    proj = obj['project']
     jira = obj['auth_jira']
 
     # Search returns first 50 results, `maxResults` must be set to exceed this
@@ -71,7 +134,7 @@ def list(obj, long, task_id):
     if task_id is not None:
         extra_filter =  f'AND TaskWarriorID = {task_id}'
 
-    for issue in jira.search_issues(f'project={proj} {extra_filter} order by created desc ', maxResults=False):
+    for issue in jira.search_issues(f'{extra_filter} order by created desc ', maxResults=False):
         print_issue(issue, long)
 
 
@@ -82,13 +145,13 @@ def list(obj, long, task_id):
 
 
             
-@cli.command()
+@cli.command("push")
 @click.option('-i', '--task-id', type=int)
 @click.option("-l", "--long", is_flag=True)
 @click.option("-U", "--allow-update", is_flag=True)
+@click.option("-1", "--run-once", is_flag=True)
 @click.pass_obj
-def push(obj, task_id, long, allow_update):
-    proj = obj['project']
+def _push(obj, task_id, long, allow_update, run_once):
     jira = obj['auth_jira']
 
     # print(json.dumps(jira.createmeta(
@@ -97,6 +160,20 @@ def push(obj, task_id, long, allow_update):
     #         indent=4, 
     #         sort_keys=True))
 
+    while True:
+        push(jira, task_id, long, allow_update)
+
+        if run_once:
+            break
+        else:
+            logger.info("sleeping...")
+            for i in range(60):
+                time.sleep(1)
+                print(".", end="", flush=True)
+                
+
+
+def push(jira: TaskWarriorJIRA, task_id, long, allow_update):
     w = TaskWarrior()
     tasks = w.load_tasks()
     # for k, v in tasks.items():
@@ -112,31 +189,21 @@ def push(obj, task_id, long, allow_update):
         for issuetype_key in ['redminetracker']:
             if issuetype_key in task:
                 issuetype = task[issuetype_key]        
-                print('issuetype:', issuetype)
+                logger.debug('deduced issuetype %s from %s', issuetype_key, issuetype)
 
-        # tw_label = f"TaskWarrior:{task['id']}"
-
-        existing_issues = [i for i in jira.search_issues(f'project={proj} AND TaskWarriorID = {taskid}')]
-
-        if len(existing_issues) > 1:
-            print("found many!", taskid, existing_issues)            
-            raise NotImplementedError
-
-        elif len(existing_issues) == 1:
-            print("found:", taskid, existing_issues)            
-
+                
+        issue = jira.issue_for_taskid(taskid, use_cache=not allow_update)
+                
+        if issue is not None:
             if not allow_update:
-                print("skipping updates!")
+                logger.debug("skipping updates!")
                 continue
-
-            issue = existing_issues[0]
-                        
+                
         else:
             print("NOT found, will create")
             issue = jira.create_issue(
-                    summary=task['description'],
-                    project=proj,
-                    customfield_10035 = task['id'],            
+                    taskid=taskid,
+                    summary=task['description'],                    
                     issuetype={'name': issuetype},
                 )
 
@@ -156,8 +223,8 @@ def push(obj, task_id, long, allow_update):
         fields = dict(
                     summary=task['description'],
                     description="\n".join([f"{k}: {v}" for k, v in task.items()]), 
-                    labels=None,
-            )
+                    labels=None
+                )
 
         # estimate
 
