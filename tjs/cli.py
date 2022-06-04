@@ -222,6 +222,20 @@ def push(jira: TaskWarriorJIRA, taskuuid: str, long: bool, allow_update: bool):
             duplicate_issues.append(task)
 
 
+def apply_rules(jira, issue):
+    logger.info("applying rules to %s", issue)
+    
+    for label in issue.fields.labels:
+        if label in ['cta', 'integral', 'oda', 'smartsky']:
+            issue.add_field_value(
+                'customfield_10047', label
+            )
+
+        if label in ['ideas']:
+            issue.add_field_value(
+                'customfield_10046', 'thinking'
+            )
+
 
 def push_task(jira, task, allow_update, long):
     issuetype = 'Task'
@@ -238,6 +252,8 @@ def push_task(jira, task, allow_update, long):
 
         if long:
             print_issue(issue, True)
+
+        apply_rules(jira, issue)
 
         if not allow_update:
             logger.debug("skipping updates!")
